@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Automatic SessionEnd handoffs no longer repeat the last prompt in both the
+  summary and `open_questions`, no longer list tool families (`file`,
+  `non-file`, …) as `next_steps`, and now state that they were generated from
+  prompts only with no verified state captured. (NCHILLC/ai-memory#1)
 - A failed scheduled `auto_improve` review no longer removes its session from
   the queue permanently. The scheduler claims a session before reviewing it,
   and the candidate query excludes any session that holds a claim — but nothing
