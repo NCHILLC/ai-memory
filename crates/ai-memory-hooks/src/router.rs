@@ -3119,25 +3119,29 @@ fn build_auto_handoff(
         }
     }
     let mut prompts: Vec<String> = Vec::new();
-    let mut tools: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for obs in observations {
-        match obs.kind {
-            ObservationKind::UserPrompt => {
-                let text = pick_text(obs);
-                if !text.is_empty() {
-                    prompts.push(text.to_string());
-                }
+        if obs.kind == ObservationKind::UserPrompt {
+            let text = pick_text(obs);
+            if !text.is_empty() {
+                prompts.push(text.to_string());
             }
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
-                tools.insert(obs.title.as_str());
-            }
-            _ => {}
         }
     }
     let first_prompt = prompts.first().cloned();
     let last_prompt = prompts.last().cloned();
+    let open_questions = derive_open_questions(observations, &last_prompt);
+    // A heuristic that quotes the last prompt already carries it; the summary
+    // must not repeat it.
+    let last_quoted = last_prompt.as_deref().is_some_and(|last| {
+        let quoted = cap_handoff_text(last.trim());
+        !quoted.is_empty() && open_questions.iter().any(|q| q.ends_with(quoted.as_str()))
+    });
     let summary = match (&first_prompt, &last_prompt) {
+        (Some(first), Some(last)) if first == last && last_quoted => {
+            "Single-prompt session; the prompt is quoted under open questions.".to_string()
+        }
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
+        (Some(first), Some(_)) if last_quoted => format!("Started: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
         (Some(first), None) => format!("Started: {}", cap(first)),
         _ => format!(
@@ -3145,15 +3149,13 @@ fn build_auto_handoff(
             observations.len()
         ),
     };
-    let open_questions = derive_open_questions(observations, &last_prompt);
-    let next_steps = if tools.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
-            "Tools used: {}",
-            tools.into_iter().collect::<Vec<_>>().join(", ")
-        )]
-    };
+    // The closed hook schema records tool families ("file", "non-file", ...),
+    // not what happened, so there is no verified state to hand over. Say so
+    // rather than listing tool families as if they were next steps.
+    let summary = format!(
+        "{summary}\n\nAuto-generated from prompts only; no verified state (commits, test \
+         results, remaining work) was captured."
+    );
     NewHandoff {
         workspace_id,
         project_id,
@@ -3163,7 +3165,7 @@ fn build_auto_handoff(
         cwd: cwd.map(std::path::PathBuf::from),
         summary,
         open_questions,
-        next_steps,
+        next_steps: Vec::new(),
         files_touched: Vec::new(),
         owner_user,
     }
@@ -12901,6 +12903,47 @@ mod tests {
         let q = derive_open_questions(&obs, &last);
         // "好的" is filtered → fallback to empty.
         assert!(q.is_empty(), "expected empty for acknowledgment, got {q:?}");
+    }
+
+    fn auto_handoff_for(obs: &[ai_memory_core::Observation]) -> ai_memory_core::NewHandoff {
+        build_auto_handoff(
+            ai_memory_core::WorkspaceId::new(),
+            ai_memory_core::ProjectId::new(),
+            AgentKind::Codex,
+            SessionId::new(),
+            None,
+            obs,
+            None,
+        )
+    }
+
+    #[test]
+    fn auto_handoff_quotes_single_prompt_once_and_lists_no_tool_families() {
+        let handoff = auto_handoff_for(&[
+            mk_obs(ObservationKind::UserPrompt, "fix", "fix the login bug"),
+            mk_obs(ObservationKind::PostToolUse, "file", ""),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ]);
+        assert_eq!(handoff.open_questions, ["Continue from: fix the login bug"]);
+        assert!(!handoff.summary.contains("fix the login bug"), "{}", handoff.summary);
+        assert!(handoff.summary.contains("no verified state"), "{}", handoff.summary);
+        assert!(handoff.next_steps.is_empty(), "{:?}", handoff.next_steps);
+    }
+
+    #[test]
+    fn auto_handoff_keeps_prompt_in_summary_when_open_questions_do_not_quote_it() {
+        // File work with no Stop takes the abnormal-exit heuristic, which does
+        // not quote the prompt, so the summary is the only place it survives.
+        let handoff = auto_handoff_for(&[
+            mk_obs(ObservationKind::UserPrompt, "fix", "fix the login bug"),
+            mk_obs(ObservationKind::PostToolUse, "file", ""),
+        ]);
+        assert!(
+            handoff.summary.starts_with("Session focused on: fix the login bug"),
+            "{}",
+            handoff.summary
+        );
     }
 
     #[test]
